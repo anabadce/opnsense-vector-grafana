@@ -1,0 +1,200 @@
+sources:
+  opnsense_udp:
+    type: syslog
+    address: 0.0.0.0:5140
+    mode: udp
+
+  opnsense_tcp:
+    type: syslog
+    address: 0.0.0.0:5140
+    mode: tcp
+
+transforms:
+  # =============================================
+  # STEP 1: Parse syslog headers
+  # =============================================
+  parse_syslog:
+    type: remap
+    inputs:
+      - opnsense_udp
+      - opnsense_tcp
+    source: |
+      .structured = parse_syslog!(.message)
+      . = merge(., .structured)
+      del(.structured)
+
+  # =============================================
+  # STEP 2: Parse OPNsense message bodies
+  # =============================================
+  parse_opnsense:
+    type: remap
+    inputs:
+      - parse_syslog
+    source: |
+      # Normalize base fields from syslog
+      .host = string!(.hostname) ?? "opnsense"
+      .app = string!(.appname) ?? "unknown"
+      .level = string!(.severity) ?? "info"
+
+      # Store raw message
+      .raw_message = .message
+
+      # =============================================
+      # PARSE: filterlog (firewall logs - comma-separated)
+      # Format: rule_id,,,rule_uuid,interface,reason,action,direction,ip_version,protocol_id,protocol,src_ip,dst_ip,src_port,dst_port,data_length
+      # =============================================
+      if .app == "filterlog" && is_string(.message) {
+        .fw_fields = split(.message, ",")
+        .fw_count = length(.fw_fields)
+
+        if .fw_count >= 16 {
+          .rule_id = .fw_fields[0]
+          .rule_uuid = .fw_fields[3]
+          .interface = .fw_fields[4]
+          .reason = .fw_fields[5]
+          .action = .fw_fields[6]
+          .direction = .fw_fields[7]
+          .ip_version = .fw_fields[8]
+          .protocol_id = .fw_fields[9]
+          .protocol = .fw_fields[10]
+          .src_ip = .fw_fields[11]
+          .dst_ip = .fw_fields[12]
+          .src_port = .fw_fields[13]
+          .dst_port = .fw_fields[14]
+          .data_length = .fw_fields[15]
+
+          # Clean up data_length (remove "datalength=" prefix if present)
+          if starts_with(string!(.data_length), "datalength=") {
+            .data_length = replace(string!(.data_length), "datalength=", "")
+          }
+        }
+        del(.fw_fields)
+        del(.fw_count)
+        del(.message)
+      }
+
+      # =============================================
+      # PARSE: dnsmasq - DNS queries
+      # Format: query[A] domain.com from 192.168.1.100
+      # =============================================
+      if .app == "dnsmasq" && is_string(.message) {
+        # query[A] domain.com from 192.168.1.100
+        if starts_with(.message, "query[") {
+          .dns_parts = split(.message, " ")
+          .query_type = replace(.dns_parts[0], "query[", "")
+          .query_type = replace(.query_type, "]", "")
+          .domain = .dns_parts[1]
+          .client_ip = .dns_parts[3]
+          del(.dns_parts)
+        }
+        # /etc/hosts or DHCP configured address 0.0.0.0 for domain.com
+        else if contains(.message, "address 0.0.0.0 for") {
+          .domain = replace(.message, "/etc/hosts or DHCP configured address 0.0.0.0 for ", "")
+          .action = "blocked"
+        }
+        del(.message)
+      }
+
+      # =============================================
+      # PARSE: dnsmasq-dhcp (IPv6 router advertisements)
+      # Format: RTR-ADVERT(igc0) 2406:6d00:ab78:5d00::
+      # =============================================
+      if .app == "dnsmasq-dhcp" && is_string(.message) {
+        .rtr_match = match(.message, r'RTR-ADVERT\(([^)]+)\)\s+(.+)')
+        if .rtr_match != null {
+          .interface = .rtr_match[1]
+          .ipv6_prefix = .rtr_match[2]
+        }
+        del(.rtr_match)
+        del(.message)
+      }
+
+      # =============================================
+      # PARSE: radvd (IPv6 router advertisement daemon)
+      # Format: our AdvCurHopLimit on igc0 doesn't agree with fe80::...
+      # =============================================
+      if .app == "radvd" && is_string(.message) {
+        .radvd_match = match(.message, r'our AdvCurHopLimit on ([^ ]+) doesn.* with ([a-f0-9:]+)')
+        if .radvd_match != null {
+          .interface = .radvd_match[1]
+          .ipv6_address = .radvd_match[2]
+          .issue = "AdvCurHopLimit mismatch"
+        }
+        del(.radvd_match)
+        del(.message)
+      }
+
+      # =============================================
+      # PARSE: configd.py (OPNsense configuration actions)
+      # Format: action allowed dnsmasq.list.dhcp_options for user root
+      # =============================================
+      if .app == "configd.py" && is_string(.message) {
+        .cfg_parts = split(.message, " ")
+        if length(.cfg_parts) >= 6 {
+          .config_action = .cfg_parts[1]
+          .config_resource = .cfg_parts[2]
+          .config_user = .cfg_parts[5]
+        }
+        del(.cfg_parts)
+        del(.message)
+      }
+
+      # =============================================
+      # PARSE: syslog-ng and others (simple text)
+      # =============================================
+      if is_string(.message) {
+        .log_message = .message
+        del(.message)
+      }
+
+  # =============================================
+  # STEP 3: Final formatting for Loki
+  # =============================================
+  format_opnsense:
+    type: remap
+    inputs:
+      - parse_opnsense
+    source: |
+      # Ensure all fields are properly typed
+      .host = string!(.host)
+      .app = string!(.app)
+      .level = string!(.level)
+
+      # Add type identifier for each log category
+      if .app == "filterlog" {
+        .log_type = "firewall"
+      } else if .app == "dnsmasq" {
+        .log_type = if .action == "blocked" { "dns_blocked" } else { "dns_query" }
+      } else if .app == "dnsmasq-dhcp" {
+        .log_type = "dhcp"
+      } else if .app == "radvd" {
+        .log_type = "ipv6"
+      } else if .app == "configd.py" {
+        .log_type = "config"
+      } else {
+        .log_type = "system"
+      }
+
+      # Set dns_domain for Loki label
+      if exists(.domain) {
+        .dns_domain = .domain
+      }
+
+sinks:
+  loki_out:
+    type: loki
+    inputs:
+      - format_opnsense
+    endpoint: http://loki:3100
+    encoding:
+      codec: json
+    labels:
+      source: opnsense
+      host: "{{ host }}"
+      app: "{{ app }}"
+      level: "{{ level }}"
+      log_type: "{{ log_type }}"
+      interface: "{{ interface }}"
+      action: "{{ action }}"
+      protocol: "{{ protocol }}"
+      dns_domain: "{{ dns_domain }}"

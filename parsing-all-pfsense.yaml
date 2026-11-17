@@ -1,0 +1,47 @@
+transforms:
+  parse_syslog:
+    type: remap
+    inputs:
+      - syslog_udp
+    source: |
+      .structured = parse_syslog!(.message)
+      . = merge(., .structured)
+      del(.structured)parse_pfsense_message:
+    type: remap
+    inputs:
+      - parse_syslog
+    source: |
+      if exists(.message) && is_string(.message) {
+        .pf_fields, err = split(.message, ",")
+        if err == null {
+          field_count = length(.pf_fields)
+          if field_count >= 21 {
+            .rule_id        = .pf_fields[0]
+            .tracker        = .pf_fields[3]
+            .interface      = .pf_fields[4]
+            .action         = .pf_fields[5]
+            .direction      = .pf_fields[6]
+            .ip_version     = .pf_fields[8]
+            .ttl            = .pf_fields[11]
+            .packet_id      = .pf_fields[12]
+            .protocol_id    = .pf_fields[16]
+            .protocol_name  = .pf_fields[17]
+            .packet_length  = .pf_fields[18]
+            .src_ip         = .pf_fields[19]
+            .dst_ip         = .pf_fields[20]
+            if field_count > 22 {
+              .src_port = .pf_fields[21]
+              .dst_port = .pf_fields[22]
+            }
+            if field_count > 26 {
+              .tcp_flags     = .pf_fields[23]
+              .tcp_seq       = .pf_fields[24]
+              .tcp_ack       = .pf_fields[25]
+              .tcp_window    = .pf_fields[26]
+              .tcp_options   = .pf_fields[27]
+            }
+            del(.message)
+          }
+        }
+        del(.pf_fields)
+      }
